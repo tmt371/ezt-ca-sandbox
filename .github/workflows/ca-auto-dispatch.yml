@@ -1,0 +1,101 @@
+name: Cloud-A Auto Dispatch (Sandbox)
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  ca-agent-worker:
+    # 安全鎖 1：只有貼上 ca-ready 標籤且由倉庫擁有者觸發才執行，絕不浪費 Actions 額度
+    if: github.event.label.name == 'ca-ready' && github.event.issue.user.login == github.repository_owner
+    runs-on: ubuntu-latest
+    # 安全鎖 2：強制 5 分鐘超時斷電，保護學生方案 3000 分鐘額度
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run Cloud-A Free-Tier Agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          cat << 'EOF' > run-ca.mjs
+          import fs from 'node:fs';
+
+          const apiKey = process.env.GEMINI_API_KEY;
+          const issueNum = process.env.ISSUE_NUMBER;
+          const title = process.env.ISSUE_TITLE;
+          const body = process.env.ISSUE_BODY;
+
+          if (!apiKey) {
+            console.error('HOLD: GEMINI_API_KEY missing');
+            process.exit(1);
+          }
+
+          const readme = fs.existsSync('README.md') ? fs.readFileSync('README.md', 'utf8') : '';
+          const prompt = `你是 Cloud-A 自動化程式助手。請根據以下 GitHub Issue 指令產出嚴格的 JSON 修改計畫（不要任何 Markdown 標記或額外文字）。
+          Issue #${issueNum}: ${title}
+          內容: ${body}
+          目前 README.md 內容:
+          ${readme}
+
+          請只回傳以下 JSON 格式：
+          {"files": [{"path": "相對檔案路徑", "content": "完整檔案內容"}], "summary": "中文變更摘要"}`;
+
+          const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { responseMimeType: 'application/json', temperature: 0.1 }
+            })
+          });
+
+          if (!res.ok) {
+            console.error('HOLD API Error:', res.status, await res.text());
+            process.exit(1);
+          }
+
+          const data = await res.json();
+          const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          const plan = JSON.parse(rawText);
+
+          for (const f of plan.files) {
+            if (f.path.includes('..') || f.path.startsWith('/') || f.path.startsWith('.github/')) {
+              throw new Error('HOLD: Unsafe file path blocked: ' + f.path);
+            }
+            fs.writeFileSync(f.path, f.content, 'utf8');
+            console.log('Updated:', f.path);
+          }
+          fs.writeFileSync('.ca-summary.txt', plan.summary || 'Automated update by Cloud-A', 'utf8');
+          EOF
+          node run-ca.mjs
+          rm -f run-ca.mjs
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat(ca): resolve issue #${{ github.event.issue.number }}"
+          branch: "ca/auto-issue-${{ github.event.issue.number }}"
+          delete-branch: true
+          title: "[CA-AUTO] #${{ github.event.issue.number }} ${{ github.event.issue.title }}"
+          body: |
+            由 Cloud-A 無人值守管線自動執行完成。
+            Closes #${{ github.event.issue.number }}
+
+            變更摘要請見本次 Commit 內容。
